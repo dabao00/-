@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" /><meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="跑单宝宝" /><meta name="theme-color" content="#E9ECE4" media="(prefers-color-scheme: light)" /><meta name="theme-color" content="#0C0F0D" media="(prefers-color-scheme: dark)" />
+<title>跑单宝宝</title>
+<script src="https://cdn.bootcdn.net/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdn.bootcdn.net/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<style>*{box-sizing:border-box}html,body{margin:0;background:#E9ECE4;-webkit-tap-highlight-color:transparent}@media(prefers-color-scheme:dark){html,body{background:#0C0F0D;color-scheme:dark}}button{font-family:inherit;cursor:pointer;border:none;transition:transform .12s,background .25s,color .25s}button:active{transform:scale(.95)}input{font-family:inherit;outline:none;-webkit-appearance:none}input:focus{box-shadow:0 0 0 2px #2B3BFF}.fade{animation:f .4s cubic-bezier(.2,.8,.2,1)}@keyframes f{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}@keyframes pop{from{transform:translate(-50%,-50%) rotate(0);opacity:1}to{transform:translate(calc(-50% + var(--x)),calc(-50% + var(--y))) rotate(540deg);opacity:0}}</style>
+</head><body><div id="root"></div><script>
+const { useState, useEffect, useMemo, useRef } = React;
+const DEFAULT_TIERS = [
+    { type: "milestone", limit: 600, totalAtLimit: 2600 },
+    { limit: 1000, rate: 4.7 },
+    { limit: 1300, rate: 5.2 },
+    { limit: null, rate: 5.6 },
+];
+function fmtLocalDate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+function todayStr() { return fmtLocalDate(new Date()); }
+function monthKeyOf(d) { return d.slice(0, 7); }
+function monthLabel(k) { const [y, m] = k.split("-"); return `${y}年${parseInt(m, 10)}月`; }
+function shortDay(d) { return `${parseInt(d.slice(8, 10), 10)}日`; }
+function fmtClock(d) {
+    const weekNames = ["日", "一", "二", "三", "四", "五", "六"];
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${d.getMonth() + 1}月${d.getDate()}日 周${weekNames[d.getDay()]} ${hh}:${mm}`;
+}
+function daysInMonth(key) { const [y, m] = key.split("-").map(Number); return new Date(y, m, 0).getDate(); }
+function shiftMonthKey(key, delta) {
+    const [y, m] = key.split("-").map(Number);
+    const d = new Date(y, m - 1 + delta, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function getWeekStart(dateStr) {
+    const d = new Date(dateStr + "T00:00:00");
+    const day = d.getDay();
+    const diff = day === 0 ? -6 : 1 - day;
+    d.setDate(d.getDate() + diff);
+    return fmtLocalDate(d);
+}
+function weekLabel(weekStartStr) {
+    const start = new Date(weekStartStr + "T00:00:00");
+    const end = new Date(start);
+    end.setDate(end.getDate() + 6);
+    return `${start.getMonth() + 1}/${start.getDate()}-${end.getMonth() + 1}/${end.getDate()}`;
+}
+// Total pay for having completed `cursor` orders this month, given tiers[0] is
+// a milestone (flat bonus once reached, estimated proportionally before that)
+// and tiers[1..] are ordinary per-order rate tiers above the milestone.
+function totalPayAtCursor(cursor, tiers) {
+    const milestone = tiers[0];
+    const perOrderTiers = tiers.slice(1);
+    const milestoneOrders = Math.min(cursor, milestone.limit);
+    let pay = milestoneOrders >= milestone.limit
+        ? milestone.totalAtLimit
+        : (milestone.limit > 0 ? (milestoneOrders / milestone.limit) * milestone.totalAtLimit : 0);
+    let remaining = Math.max(0, cursor - milestone.limit);
+    let lower = milestone.limit;
+    for (const t of perOrderTiers) {
+        if (remaining <= 0)
+            break;
+        const limit = t.limit === null ? Infinity : t.limit;
+        if (lower >= limit)
+            continue;
+        const room = limit - lower;
+        const use = Math.min(remaining, room);
+        if (use > 0) {
+            pay += use * t.rate;
+            remaining -= use;
+            lower += use;
+        }
+    }
+    return pay;
+}
+function computeMonth(entries, baseline, baselineHours, tiers) {
+    const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
+    const milestone = tiers[0];
+    let cursor = baseline;
+    let totalPay = totalPayAtCursor(baseline, tiers);
+    const baselinePay = totalPay;
+    let totalOrders = 0;
+    let totalHours = baselineHours || 0, hourEntries = baselineHours ? 1 : 0;
+    const rows = sorted.map((e) => {
+        const startCursor = cursor;
+        const endCursor = cursor + e.orders;
+        const pay = totalPayAtCursor(endCursor, tiers) - totalPayAtCursor(startCursor, tiers);
+        const isEstimate = endCursor < milestone.limit;
+        const row = { ...e, pay, startCount: startCursor, endCount: endCursor, isEstimate };
+        cursor = endCursor;
+        totalPay += pay;
+        totalOrders += e.orders;
+        if (e.hours) {
+            totalHours += e.hours;
+            hourEntries += 1;
+        }
+        return row;
+    });
+    const isEstimate = cursor < milestone.limit;
+    return { rows, totalPay, totalOrders, totalHours, hourEntries, cursor, baselinePay, isEstimate };
+}
+function currentTierInfo(cursor, tiers) {
+    const milestone = tiers[0];
+    if (cursor < milestone.limit) {
+        return { inMilestonePhase: true, rate: null, nextBound: milestone.limit };
+    }
+    const perOrderTiers = tiers.slice(1);
+    for (const t of perOrderTiers) {
+        const limit = t.limit === null ? Infinity : t.limit;
+        if (cursor < limit)
+            return { inMilestonePhase: false, rate: t.rate, nextBound: t.limit };
+    }
+    const last = perOrderTiers[perOrderTiers.length - 1];
+    return { inMilestonePhase: false, rate: last ? last.rate : null, nextBound: null };
+}
+// Estimate how many additional orders (from cursor) are needed to earn payNeeded,
+// walking forward through the milestone phase (if still in it) then the per-order tiers.
+function ordersToEarn(cursor, payNeeded, tiers) {
+    if (payNeeded <= 0) return 0;
+    const milestone = tiers[0];
+    let remainingPay = payNeeded;
+    let pos = cursor;
+    let orders = 0;
+    if (pos < milestone.limit) {
+        const rate = milestone.limit > 0 ? milestone.totalAtLimit / milestone.limit : 0;
+        const roomOrders = milestone.limit - pos;
+        const roomPay = roomOrders * rate;
+        if (remainingPay <= roomPay) {
+            return Math.ceil(remainingPay / rate);
+        }
+        orders += roomOrders;
+        remainingPay -= roomPay;
+        pos = milestone.limit;
+    }
+    for (const t of tiers.slice(1)) {
+        if (remainingPay <= 0) break;
+        const limit = t.limit === null ? Infinity : t.limit;
+        if (pos >= limit) continue;
+        const roomOrders = limit - pos;
+        const roomPay = roomOrders * t.rate;
+        if (remainingPay <= roomPay) {
+            orders += remainingPay / t.rate;
+            remainingPay = 0;
+            break;
+        }
+        orders += roomOrders;
+        remainingPay -= roomPay;
+        pos = limit;
+    }
+    return Math.ceil(orders);
+}
+const STORAGE_KEY = "rider-pay-v2";
+function loadState() {
+    try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw)
+            return JSON.parse(raw);
+    }
+    catch (e) { }
+    return null;
+}
+function saveState(state) {
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    }
+    catch (e) { }
+}
+function pruneOldMonths(state) {
+    const nowKey = monthKeyOf(todayStr());
+    const prevKey = shiftMonthKey(nowKey, -1);
+    const keep = new Set([nowKey, prevKey]);
+    const filterObj = (obj) => Object.fromEntries(Object.entries(obj || {}).filter(([k]) => keep.has(k)));
+    return {
+        tiers: state.tiers,
+        entriesByMonth: filterObj(state.entriesByMonth),
+        startCounts: filterObj(state.startCounts),
+        startHours: filterObj(state.startHours),
+        goals: filterObj(state.goals),
+        timer: state.timer || null,
+    };
+}
+"use strict";
+"use strict";
+"use strict";
+"use strict";
+"use strict";
+"use strict";
+const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+const K = dark ? { bg: "#0C0F0D", card: "#171B18", ink: "#F2F4EF", sub: "#A3AAA0", mute: "#6F766D", line: "rgba(255,255,255,.08)", blue: "#7B87FF", soft: "rgba(123,135,255,.16)", org: "#FF7A3D", green: "#3DD9A0", red: "#FF6B70", track: "#2A302B", gsoft: "rgba(61,217,160,.16)", seg: "rgba(255,255,255,.08)", tabbg: "rgba(30,35,31,.86)" } : { bg: "#E9ECE4", card: "#FFFFFF", ink: "#101311", sub: "#5E645C", mute: "#9AA096", line: "rgba(16,19,17,.08)", blue: "#2B3BFF", soft: "#E4E7FF", org: "#FF6B2C", green: "#0E9F6E", red: "#E5484D", track: "#DDE1D6", gsoft: "#DFF5EC", seg: "rgba(16,19,17,.07)", tabbg: "rgba(255,255,255,.86)" };
+const M = "ui-monospace,'SF Mono',Menlo,monospace";
+const card = { background: K.card, borderRadius: 28, padding: 20, marginTop: 14, boxShadow: "0 1px 0 rgba(16,19,17,.04),0 16px 32px -16px rgba(16,19,17,.2)" };
+const lab = { fontSize: 12, letterSpacing: ".08em", color: K.mute, fontWeight: 600 };
+const inp = { width: "100%", border: "none", background: K.bg, borderRadius: 14, padding: "12px 14px", fontSize: 16, color: K.ink, fontFamily: M };
+function useTween(t) { const [v, setV] = useState(t); const r = useRef(t); useEffect(() => { const f = r.current, t0 = performance.now(); let id; const s = n => { const p = Math.min(1, (n - t0) / 700), c = f + (t - f) * (1 - Math.pow(1 - p, 3)); r.current = c; setV(c); if (p < 1)
+    id = requestAnimationFrame(s); }; id = requestAnimationFrame(s); return () => cancelAnimationFrame(id); }, [t]); return v; }
+const pol = (cx, cy, r, a) => [cx + r * Math.cos(a * Math.PI / 180), cy + r * Math.sin(a * Math.PI / 180)];
+function Dial({ cursor, tiers, total, est, info, goalAt }) {
+    const cx = 150, cy = 135, r = 100, A0 = 150, SW = 240, H = 215, bounded = tiers.filter(t => t.limit !== null).map(t => t.limit);
+    const max = Math.max(bounded[bounded.length - 1] * 1.12, cursor * 1.04, (goalAt || 0) * 1.05), frac = Math.min(1, cursor / max), len = r * SW * Math.PI / 180;
+    const [x0, y0] = pol(cx, cy, r, A0), [x1, y1] = pol(cx, cy, r, A0 + SW), d = `M${x0} ${y0}A${r} ${r} 0 1 1 ${x1} ${y1}`;
+    const tv = useTween(total), [hx, hy] = pol(cx, cy, r, A0 + SW * frac), [gx, gy] = goalAt ? pol(cx, cy, r, A0 + SW * goalAt / max) : [0, 0], [gtx, gty] = goalAt ? pol(cx, cy, r + 26, A0 + SW * goalAt / max) : [0, 0];
+    return React.createElement("div", { style: { position: "relative", marginTop: 6 } },
+        React.createElement("svg", { viewBox: `0 0 300 ${H}`, style: { width: "100%", display: "block" } },
+            React.createElement("path", { d: d, fill: "none", stroke: K.track, strokeWidth: "14", strokeLinecap: "round" }),
+            React.createElement("path", { d: d, fill: "none", stroke: K.blue, strokeWidth: "14", strokeLinecap: "round", strokeDasharray: `${len * frac} ${len}`, style: { transition: "stroke-dasharray .9s cubic-bezier(.2,.8,.2,1)" } }),
+            bounded.map((L, i) => { const a = A0 + SW * L / max, [a1, b1] = pol(cx, cy, r - 15, a), [a2, b2] = pol(cx, cy, r + 12, a), [tx, ty] = pol(cx, cy, r + 25, a); return React.createElement("g", { key: i },
+                React.createElement("line", { x1: a1, y1: b1, x2: a2, y2: b2, stroke: cursor >= L ? K.blue : K.mute, strokeWidth: "2" }),
+                React.createElement("text", { x: tx, y: ty + 3, textAnchor: "middle", fontSize: "9", fill: K.mute, fontFamily: M }, L)); }),
+            goalAt && React.createElement("g", null,
+                React.createElement("circle", { cx: gx, cy: gy, r: "6", fill: K.org }),
+                React.createElement("text", { x: gtx, y: gty + 3, textAnchor: "middle", fontSize: "10", fontWeight: "700", fill: K.org }, "\u76EE\u6807")),
+            React.createElement("circle", { cx: hx, cy: hy, r: "9", fill: K.card, stroke: K.org, strokeWidth: "4", style: { transition: "all .9s" } })),
+        React.createElement("div", { style: { position: "absolute", left: "18%", right: "18%", top: `${(cy - 38) / H * 100}%`, textAlign: "center" } },
+            React.createElement("div", { style: { fontSize: 38, fontWeight: 800, letterSpacing: "-.03em", fontFamily: M, lineHeight: 1 } },
+                "\u00A5",
+                tv.toFixed(1)),
+            React.createElement("div", { style: { marginTop: 10, display: "inline-block", fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 99, background: est ? K.soft : K.gsoft, color: est ? K.blue : K.green } }, est ? "估算值" : `当前 ${info.rate.toFixed(1)} 元/单`)));
+}
+function Party({ text, onDone }) {
+    useEffect(() => { const t = setTimeout(onDone, 2800); return () => clearTimeout(t); }, []);
+    const cs = [K.blue, K.org, K.green, "#FFC940", "#FF5FA2"];
+    return React.createElement("div", { style: { position: "fixed", inset: 0, pointerEvents: "none", zIndex: 50, overflow: "hidden" } },
+        Array.from({ length: 40 }).map((_, i) => { const a = i / 40 * Math.PI * 2, dd = 100 + (i % 5) * 40; return React.createElement("i", { key: i, style: { position: "absolute", left: "50%", top: "38%", width: 9, height: 14, borderRadius: 3, background: cs[i % 5], "--x": `${Math.cos(a) * dd}px`, "--y": `${Math.sin(a) * dd + 90}px`, animation: `pop ${1.3 + (i % 4) * .25}s cubic-bezier(.15,.8,.3,1) forwards` } }); }),
+        React.createElement("div", { style: { position: "absolute", left: 0, right: 0, top: "32%", display: "flex", justifyContent: "center" } },
+            React.createElement("div", { className: "fade", style: { background: K.ink, color: K.bg, padding: "16px 22px", borderRadius: 22, fontWeight: 800, fontSize: 18, textAlign: "center", boxShadow: "0 20px 50px rgba(0,0,0,.35)" } }, text)));
+}
+function Chart({ data }) {
+    const W = 320, H = 150, p = 8, n = data.length, mx = Math.max(1, ...data.map(d => d.pay)), bw = (W - p * 2) / n, hh = d => Math.max(3, d.pay / mx * (H - 52)), pts = data.map((d, i) => [p + bw * i + bw / 2, H - 24 - hh(d)]);
+    return React.createElement("svg", { viewBox: `0 0 ${W} ${H}`, style: { width: "100%" } },
+        data.map((d, i) => React.createElement("rect", { key: i, x: p + bw * i + bw * .2, y: H - 24 - hh(d), width: bw * .6, height: hh(d), rx: "5", fill: d.pay === mx ? K.org : K.track })),
+        n > 1 && React.createElement("polyline", { points: pts.map(q => q.join(",")).join(" "), fill: "none", stroke: K.blue, strokeWidth: "2.5", strokeLinejoin: "round", strokeLinecap: "round" }),
+        pts.map((q, i) => React.createElement("circle", { key: i, cx: q[0], cy: q[1], r: "3.5", fill: K.card, stroke: K.blue, strokeWidth: "2" })),
+        data.map((d, i) => (n <= 7 || i % Math.ceil(n / 6) === 0) && React.createElement("text", { key: i, x: p + bw * i + bw / 2, y: H - 6, textAnchor: "middle", fontSize: "9", fill: K.mute }, d.label)));
+}
+const Row = ({ a, b, c, u, pc }) => { const f = v => v == null ? "—" : u === "¥" ? `¥${v.toFixed(1)}` : u === "h" ? `${+v.toFixed(2)}h` : v.toFixed(1); return React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1.1fr 1fr 1fr 52px", padding: "11px 0", borderTop: `1px solid ${K.line}`, alignItems: "center" } },
+    React.createElement("span", { style: { fontSize: 13, color: K.sub } }, a),
+    React.createElement("b", { style: { fontFamily: M, fontSize: 14, textAlign: "right" } }, f(b)),
+    React.createElement("span", { style: { fontFamily: M, fontSize: 13, color: K.mute, textAlign: "right" } }, f(c)),
+    React.createElement("span", { style: { fontFamily: M, fontSize: 11, textAlign: "right", color: pc == null ? K.mute : pc >= 0 ? K.green : K.red } }, pc == null ? "" : `${pc >= 0 ? "+" : ""}${pc.toFixed(0)}%`)); };
+const Bar = ({ v, color }) => React.createElement("div", { style: { height: 8, borderRadius: 9, background: K.track, overflow: "hidden", marginTop: 10 } },
+    React.createElement("div", { style: { height: "100%", width: `${Math.min(100, v * 100)}%`, background: color || K.blue, borderRadius: 9, transition: "width .8s cubic-bezier(.2,.8,.2,1)" } }));
+function mergeEntry(ex, date, n, hv) { const old = ex.find(x => x.date === date), e = { date, orders: (old ? old.orders : 0) + n }, th = Math.round(((old && old.hours || 0) + hv) * 100) / 100; if (th > 0)
+    e.hours = th; return { old, e, list: [...ex.filter(x => x.date !== date), e] }; }
+function App() {
+    const raw = loadState() || {}, init = pruneOldMonths(raw);
+    const [tiers, setTiers] = useState(init.tiers || DEFAULT_TIERS), [ebm, setEbm] = useState(init.entriesByMonth || {}), [sc, setSc] = useState(init.startCounts || {}), [sh, setSh] = useState(init.startHours || {}), [goals, setGoals] = useState(init.goals || {});
+    const [timer, setTimer] = useState(init.timer || null);
+    const nowKey = monthKeyOf(todayStr()), prevKey = shiftMonthKey(nowKey, -1);
+    const [vm, setVm] = useState(nowKey), [tab, setTab] = useState("ov"), [gran, setGran] = useState("day"), [clock, setClock] = useState(new Date());
+    const [date, setDate] = useState(todayStr()), [ord, setOrd] = useState(""), [hrs, setHrs] = useState(""), [msg, setMsg] = useState(""), [flash, setFlash] = useState(""), [party, setParty] = useState(null), [undo, setUndo] = useState(null), [edit, setEdit] = useState(null);
+    useEffect(() => { saveState(init); const t = setInterval(() => setClock(new Date()), 1000); return () => clearInterval(t); }, []);
+    const full = { tiers, entriesByMonth: ebm, startCounts: sc, startHours: sh, goals, timer };
+    const save = p => { const n = { ...full, ...p }; if (p.tiers)
+        setTiers(p.tiers); if (p.entriesByMonth)
+        setEbm(p.entriesByMonth); if (p.startCounts)
+        setSc(p.startCounts); if (p.startHours)
+        setSh(p.startHours); if (p.goals)
+        setGoals(p.goals); if ("timer" in p)
+        setTimer(p.timer); saveState(n); };
+    const startTimer = () => { const now = Date.now(); setClock(new Date(now)); save({ timer: { startedAt: now } }); };
+    const stopTimer = () => { if (!timer)
+        return; const h = (Date.now() - timer.startedAt) / 3600000; setHrs(h < 0.01 ? "0.01" : h.toFixed(2)); save({ timer: null }); };
+    const fmtElapsed = ms => { const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60, p2 = n => String(n).padStart(2, "0"); return `${p2(h)}:${p2(m)}:${p2(ss)}`; };
+    const ents = ebm[vm] || [], base = sc[vm] || 0, bh = sh[vm] || 0;
+    const S = useMemo(() => computeMonth(ents, base, bh, tiers), [ents, base, bh, tiers]);
+    const { rows, totalPay, totalOrders, totalHours, cursor, baselinePay, isEstimate } = S, info = currentTierInfo(cursor, tiers);
+    const avgH = totalHours > 0 ? totalPay / totalHours : null, dayAvg = rows.length ? totalPay / rows.length : 0;
+    const div = vm === nowKey ? new Date().getDate() : daysInMonth(vm), dOrd = cursor / div, goal = goals[vm], need = goal ? ordersToEarn(cursor, Math.max(0, goal - totalPay), tiers) : 0;
+    const N = useMemo(() => computeMonth(ebm[nowKey] || [], sc[nowKey] || 0, sh[nowKey] || 0, tiers), [ebm, sc, sh, tiers]), P = useMemo(() => computeMonth(ebm[prevKey] || [], sc[prevKey] || 0, sh[prevKey] || 0, tiers), [ebm, sc, sh, tiers]);
+    const nd = N.cursor / new Date().getDate(), pd = P.cursor / daysInMonth(prevKey), nh = N.totalHours > 0 ? N.totalPay / N.totalHours : null, ph = P.totalHours > 0 ? P.totalPay / P.totalHours : null, pc = (a, b) => b > 0 ? (a - b) / b * 100 : null;
+    const chart = useMemo(() => { if (gran === "day")
+        return rows.map(r => ({ label: shortDay(r.date), pay: r.pay })); if (gran === "week") {
+        const m = {};
+        [...N.rows, ...P.rows].forEach(r => { const w = getWeekStart(r.date); m[w] = (m[w] || 0) + r.pay; });
+        return Object.keys(m).sort().map(w => ({ label: weekLabel(w), pay: m[w] }));
+    } return [{ label: `${parseInt(prevKey.slice(5))}月`, pay: P.totalPay }, { label: `${parseInt(nowKey.slice(5))}月`, pay: N.totalPay }]; }, [gran, rows, N, P]);
+    const keys = [...new Set([...Object.keys(ebm), vm, nowKey, prevKey])].sort().reverse();
+    const add = () => { const n = parseInt(ord, 10) || 0, hv = parseFloat(hrs) || 0; if (!date || (n <= 0 && hv <= 0)) {
+        setMsg("请至少填写单量或工时");
+        return;
+    } const k = monthKeyOf(date), ex = ebm[k] || [], { old, e, list: ne } = mergeEntry(ex, date, n, hv), b = sc[k] || 0, h = sh[k] || 0, o = computeMonth(ex, b, h, tiers), r = computeMonth(ne, b, h, tiers), row = r.rows.find(x => x.date === date), orow = o.rows.find(x => x.date === date), gain = row.pay - (orow ? orow.pay : 0), L = tiers[0].limit, g = goals[k]; save({ entriesByMonth: { ...ebm, [k]: ne } }); setUndo({ k, ex, date, n, hv }); setEdit(null); setVm(k); setOrd(""); setHrs(""); setMsg(""); setFlash(["已记录", n > 0 && `+${n} 单`, hv > 0 && `+${+hv.toFixed(2)} 小时`, n > 0 && `进账 ¥${gain.toFixed(1)}${row.isEstimate ? "（估算）" : ""}`, old && `当日累计 ${e.orders} 单${e.hours ? ` · ${e.hours}h` : ""}`].filter(Boolean).join(" · ")); if (n > 0 && o.cursor < L && r.cursor >= L)
+        setParty(`🎉 跑满${L}单！前${L}单结算 ¥${tiers[0].totalAtLimit}`);
+    else if (g && o.totalPay < g && r.totalPay >= g)
+        setParty("🎯 月度目标达成！"); };
+    const del = d => { setFlash(""); setUndo(null); setEdit(null); const k = monthKeyOf(d); save({ entriesByMonth: { ...ebm, [k]: (ebm[k] || []).filter(x => x.date !== d) } }); };
+    const clrToday = () => { const t = todayStr(), k = monthKeyOf(t), ex = ebm[k] || []; if (!ex.some(x => x.date === t)) {
+        setMsg("今天还没有记录");
+        return;
+    } if (!window.confirm("确定要清空今天的记录吗？"))
+        return; save({ entriesByMonth: { ...ebm, [k]: ex.filter(x => x.date !== t) } }); setMsg("已清空今日记录"); setFlash(""); setUndo(null); setEdit(null); };
+    const clrMonth = () => { if (!ents.length) {
+        setMsg("这个月还没有记录");
+        return;
+    } if (!window.confirm(`确定要清空${monthLabel(vm)}的全部单日记录吗？起始单量、起始工时、目标不会被清空。`))
+        return; save({ entriesByMonth: { ...ebm, [vm]: [] } }); setMsg("已清空本月记录"); setFlash(""); setUndo(null); setEdit(null); };
+    const doUndo = () => { if (!undo)
+        return; save({ entriesByMonth: { ...ebm, [undo.k]: undo.ex } }); const refill = undo.n > 0 || undo.hv > 0; if (undo.n > 0)
+        setOrd(String(undo.n)); if (undo.hv > 0)
+        setHrs(String(undo.hv)); if (undo.date)
+        setDate(undo.date); setVm(undo.k); setFlash(""); setMsg(refill ? "已撤销，刚才填的数字已放回输入框，改好后重新记录即可" : "已撤销"); setUndo(null); setEdit(null); };
+    const startEdit = r => setEdit({ date: r.date, ord: String(r.orders), hrs: r.hours ? String(r.hours) : "", err: "" });
+    const saveEdit = () => { if (!edit)
+        return; const n = parseInt(edit.ord, 10) || 0, hv = parseFloat(edit.hrs) || 0; if (n < 0 || hv < 0 || (n <= 0 && hv <= 0)) {
+        setEdit({ ...edit, err: "单量和工时至少填一项，且不能是负数" });
+        return;
+    } const k = monthKeyOf(edit.date), ex = ebm[k] || [], e = { date: edit.date, orders: n }; if (hv > 0)
+        e.hours = Math.round(hv * 100) / 100; save({ entriesByMonth: { ...ebm, [k]: [...ex.filter(x => x.date !== edit.date), e] } }); setUndo({ k, ex }); setFlash(`已修改 ${edit.date.slice(5)}：${n} 单${e.hours ? ` · ${e.hours}h` : ""}`); setMsg(""); setEdit(null); };
+    const setT = (i, f, v) => { const x = f === "limit" ? parseInt(v, 10) : parseFloat(v); save({ tiers: tiers.map((t, j) => j !== i || isNaN(x) ? t : { ...t, [f]: x }) }); };
+    const addT = () => { const l = tiers[tiers.length - 1], pb = tiers.length > 2 ? tiers[tiers.length - 2].limit : tiers[0].limit; save({ tiers: [...tiers.slice(0, -1), { limit: pb + 300, rate: l.rate }, l] }); };
+    const wk = "日一二三四五六"[clock.getDay()], hm = `${String(clock.getHours()).padStart(2, "0")}:${String(clock.getMinutes()).padStart(2, "0")}`;
+    const step = n => setOrd(String(Math.max(0, (parseInt(ord, 10) || 0) + n)));
+    return React.createElement("div", { style: { minHeight: "100vh", background: K.bg, color: K.ink, fontFamily: "-apple-system,'SF Pro Display',system-ui,sans-serif", paddingBottom: 120 } },
+        party && React.createElement(Party, { text: party, onDone: () => setParty(null) }),
+        React.createElement("div", { style: { position: "sticky", top: 0, zIndex: 40, background: K.bg } },
+            React.createElement("div", { style: { maxWidth: 480, margin: "0 auto", padding: "0 16px" } },
+                React.createElement("div", { style: { paddingTop: "calc(env(safe-area-inset-top) + 20px)", paddingBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "flex-end" } },
+                    React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 32, fontWeight: 800, letterSpacing: "-.04em", lineHeight: 1 } }, "\u8DD1\u5355\u5B9D\u5B9D"),
+                        React.createElement("div", { style: { marginTop: 6, fontSize: 13, color: K.sub, fontFamily: M } },
+                            clock.getMonth() + 1,
+                            "\u6708",
+                            clock.getDate(),
+                            "\u65E5 \u5468",
+                            wk,
+                            " ",
+                            hm)),
+                    React.createElement("div", { style: { display: "flex", background: K.seg, borderRadius: 99, padding: 3 } }, keys.map(k => React.createElement("button", { key: k, onClick: () => { setVm(k); setEdit(null); }, style: { padding: "7px 14px", borderRadius: 99, fontSize: 13, fontWeight: 700, background: k === vm ? K.ink : "transparent", color: k === vm ? K.bg : K.sub } },
+                        parseInt(k.slice(5)),
+                        "\u6708")))))),
+        React.createElement("div", { style: { maxWidth: 480, margin: "0 auto", padding: "0 16px" } },
+            React.createElement("div", { key: tab, className: "fade" },
+                tab === "ov" && React.createElement(React.Fragment, null,
+                    React.createElement("div", { style: card },
+                        React.createElement("div", { style: lab },
+                            monthLabel(vm),
+                            " \u603B\u5DE5\u8D44"),
+                        React.createElement(Dial, { cursor: cursor, tiers: tiers, total: totalPay, est: isEstimate, info: info, goalAt: goal > 0 && totalPay < goal ? cursor + need : null }),
+                        React.createElement("div", { style: { textAlign: "center", marginTop: -6, fontSize: 13, color: K.sub } },
+                            "\u5171 ",
+                            base > 0 ? `${base} + ` : "",
+                            totalOrders,
+                            " \u5355",
+                            base > 0 ? ` = ${cursor} 单` : "",
+                            base > 0 && React.createElement("span", { style: { color: K.mute } },
+                                " \u00B7 \u542B\u8D77\u59CB \u2248 \u00A5",
+                                baselinePay.toFixed(1))),
+                        info.nextBound !== null && React.createElement("div", { style: { textAlign: "center", marginTop: 8, fontSize: 13, color: K.sub } },
+                            "\u518D\u8DD1 ",
+                            React.createElement("b", { style: { color: K.blue, fontFamily: M } }, info.nextBound - cursor),
+                            " \u5355\u8FDB\u5165\u4E0B\u4E00\u6863")),
+                    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginTop: 14 } }, [["本月单量", cursor], ["日均单量", dOrd.toFixed(1)], ["平均时薪", avgH ? `¥${avgH.toFixed(1)}` : "—"]].map(([a, b]) => React.createElement("div", { key: a, style: { background: K.card, borderRadius: 22, padding: "14px 14px 16px" } },
+                        React.createElement("div", { style: { fontSize: 11, color: K.mute, fontWeight: 600 } }, a),
+                        React.createElement("div", { style: { marginTop: 6, fontSize: 22, fontWeight: 800, fontFamily: M, letterSpacing: "-.02em" } }, b)))),
+                    goal > 0 && React.createElement("div", { style: card },
+                        React.createElement("div", { style: { display: "flex", justifyContent: "space-between" } },
+                            React.createElement("span", { style: lab }, "\u6708\u5EA6\u76EE\u6807"),
+                            React.createElement("span", { style: { fontFamily: M, fontSize: 14, fontWeight: 700 } },
+                                "\u00A5",
+                                totalPay.toFixed(0),
+                                " / \u00A5",
+                                goal.toFixed(0))),
+                        React.createElement(Bar, { v: totalPay / goal, color: totalPay >= goal ? K.green : K.blue }),
+                        React.createElement("div", { style: { marginTop: 10, fontSize: 13, color: K.sub } }, totalPay >= goal ? "本月目标已达成 🎉" : dayAvg > 0 ? `按目前日均 ¥${dayAvg.toFixed(1)}，还需再跑约 ${Math.ceil((goal - totalPay) / dayAvg)} 天` : "记录几天后可看到达成预测"),
+                        totalPay < goal && React.createElement(React.Fragment, null,
+                            React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 16, fontSize: 12, color: K.mute } },
+                                React.createElement("span", null, "\u8DDD\u76EE\u6807\u8FD8\u5DEE\u5355\u91CF"),
+                                React.createElement("span", { style: { fontFamily: M } },
+                                    cursor,
+                                    " / ",
+                                    cursor + need,
+                                    " \u5355")),
+                            React.createElement(Bar, { v: cursor / (cursor + need), color: K.org }),
+                            React.createElement("div", { style: { marginTop: 8, fontSize: 13, color: K.sub } },
+                                "\u518D\u8DD1 ",
+                                React.createElement("b", { style: { color: K.org, fontFamily: M } }, need),
+                                " \u5355\uFF08\u6309\u5F53\u524D\u8D39\u7387\u4F30\u7B97\uFF09\u5373\u53EF\u8FBE\u6210"))),
+                    React.createElement("div", { style: card },
+                        React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1.1fr 1fr 1fr 52px", marginBottom: 8 } },
+                            React.createElement("span", { style: lab }, "\u672C\u6708 VS \u4E0A\u6708"),
+                            React.createElement("b", { style: { fontSize: 12, textAlign: "right" } }, "\u672C\u6708"),
+                            React.createElement("span", { style: { fontSize: 12, textAlign: "right", color: K.mute } }, "\u4E0A\u6708"),
+                            React.createElement("span", null)),
+                        React.createElement(Row, { a: "\u603B\u5355\u91CF", b: N.cursor, c: P.cursor, pc: pc(N.cursor, P.cursor) }),
+                        React.createElement(Row, { a: "\u603B\u65F6\u957F", b: N.totalHours, c: P.totalHours, u: "h", pc: pc(N.totalHours, P.totalHours) }),
+                        React.createElement(Row, { a: "\u65E5\u5747\u5355\u91CF", b: nd, c: pd, pc: pc(nd, pd) }),
+                        React.createElement(Row, { a: "\u5E73\u5747\u65F6\u85AA", b: nh, c: ph, u: "\u00A5", pc: pc(nh, ph) }))),
+                tab === "rec" && React.createElement(React.Fragment, null,
+                    React.createElement("div", { style: card }, timer ? React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                        React.createElement("div", null,
+                            React.createElement("div", { style: lab }, "\u8BA1\u65F6\u4E2D"),
+                            React.createElement("div", { style: { fontFamily: M, fontSize: 30, fontWeight: 800, marginTop: 4, letterSpacing: "-.02em" } }, fmtElapsed(clock.getTime() - timer.startedAt))),
+                        React.createElement("button", { onClick: stopTimer, style: { padding: "14px 20px", borderRadius: 18, background: K.red, color: "#fff", fontWeight: 800, fontSize: 14 } }, "\u505C\u6B62\u5E76\u586B\u5165\u5DE5\u65F6")) : React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                        React.createElement("span", { style: lab }, "\u5DE5\u65F6\u8BA1\u65F6\u5668"),
+                        React.createElement("button", { onClick: startTimer, style: { padding: "10px 20px", borderRadius: 18, background: K.blue, color: dark ? K.bg : "#fff", fontWeight: 800, fontSize: 14 } }, "\u5F00\u59CB\u8BA1\u65F6"))),
+                    React.createElement("div", { style: card },
+                        React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                            React.createElement("span", { style: lab }, "\u8BB0\u5F55\u5355\u65E5\u5355\u91CF"),
+                            React.createElement("input", { type: "date", value: date, onChange: e => setDate(e.target.value), style: { ...inp, width: "auto", padding: "8px 12px", fontSize: 14 } })),
+                        React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 18 } },
+                            React.createElement("button", { onClick: () => step(-1), style: { width: 56, height: 56, borderRadius: 28, background: K.bg, fontSize: 26, color: K.ink } }, "\u2212"),
+                            React.createElement("input", { type: "number", inputMode: "numeric", placeholder: "0", value: ord, onChange: e => setOrd(e.target.value), style: { ...inp, background: "transparent", width: "50%", textAlign: "center", fontSize: 56, fontWeight: 800, padding: 0, letterSpacing: "-.04em" } }),
+                            React.createElement("button", { onClick: () => step(1), style: { width: 56, height: 56, borderRadius: 28, background: K.ink, fontSize: 26, color: K.bg } }, "+")),
+                        React.createElement("div", { style: { display: "flex", gap: 8, justifyContent: "center", marginTop: 8 } }, [5, 10, 20, 50].map(n => React.createElement("button", { key: n, onClick: () => step(n), style: { padding: "7px 14px", borderRadius: 99, background: K.soft, color: K.blue, fontSize: 13, fontWeight: 700 } },
+                            "+",
+                            n))),
+                        React.createElement("input", { type: "number", inputMode: "decimal", placeholder: "\u5DE5\u65F6\uFF08\u5C0F\u65F6\uFF0C\u53EF\u5355\u72EC\u8BB0\u5F55\uFF09", value: hrs, onChange: e => setHrs(e.target.value), style: { ...inp, marginTop: 16 } }),
+                        React.createElement("button", { onClick: add, style: { marginTop: 14, width: "100%", padding: 16, borderRadius: 18, background: K.blue, color: dark ? K.bg : "#fff", fontSize: 17, fontWeight: 800 } }, "\u8BB0\u5F55"),
+                        React.createElement("div", { style: { marginTop: 10, fontSize: 12, color: K.mute, textAlign: "center" } }, "\u6BCF\u6B21\u8BB0\u5F55\u4F1A\u7D2F\u52A0\u5230\u5F53\u5929\uFF0C\u5355\u91CF\u548C\u5DE5\u65F6\u53EF\u4EE5\u53EA\u586B\u4E00\u9879"),
+                        flash && React.createElement("div", { className: "fade", style: { marginTop: 14, padding: "14px 16px", borderRadius: 18, background: K.gsoft, color: K.green, fontWeight: 800, textAlign: "center", wordBreak: "keep-all" } },
+                            flash,
+                            undo && React.createElement("div", null,
+                                React.createElement("button", { onClick: doUndo, style: { marginTop: 10, padding: "7px 18px", borderRadius: 99, background: K.green, color: dark ? K.bg : "#fff", fontWeight: 800, fontSize: 13 } }, "\u64A4\u9500"))),
+                        msg && React.createElement("div", { style: { marginTop: 10, fontSize: 13, color: K.sub, textAlign: "center" } }, msg),
+                        React.createElement("div", { style: { display: "flex", justifyContent: "center", gap: 24, marginTop: 14 } },
+                            React.createElement("button", { onClick: clrToday, style: { background: "none", fontSize: 13, color: K.sub } }, "\u6E05\u7A7A\u4ECA\u65E5"),
+                            React.createElement("button", { onClick: clrMonth, style: { background: "none", fontSize: 13, color: K.red, fontWeight: 600 } }, "\u6E05\u7A7A\u672C\u6708"))),
+                    React.createElement("div", { style: card },
+                        React.createElement("div", { style: lab }, "\u672C\u6708\u660E\u7EC6"),
+                        rows.length === 0 ? React.createElement("div", { style: { marginTop: 12, fontSize: 14, color: K.mute } }, "\u8FD8\u6CA1\u6709\u8BB0\u5F55\uFF0C\u6DFB\u52A0\u4ECA\u5929\u7684\u5355\u91CF\u8BD5\u8BD5\u3002") : [...rows].reverse().map(r => edit && edit.date === r.date ? React.createElement("div", { key: r.date, style: { padding: "12px 0", borderTop: `1px dashed ${K.line}`, marginTop: 8 } },
+                            React.createElement("div", { style: { fontFamily: M, fontSize: 14, fontWeight: 700 } }, r.date.slice(5)),
+                            React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 8 } },
+                                React.createElement("div", { style: { flex: 1 } },
+                                    React.createElement("div", { style: { fontSize: 11, color: K.mute, marginBottom: 4 } }, "\u5355\u91CF"),
+                                    React.createElement("input", { type: "number", inputMode: "numeric", placeholder: "\u5355\u91CF", value: edit.ord, onChange: ev => setEdit({ ...edit, ord: ev.target.value, err: "" }), style: { ...inp, padding: 10 } })),
+                                React.createElement("div", { style: { flex: 1 } },
+                                    React.createElement("div", { style: { fontSize: 11, color: K.mute, marginBottom: 4 } }, "\u5DE5\u65F6\uFF08\u5C0F\u65F6\uFF09"),
+                                    React.createElement("input", { type: "number", inputMode: "decimal", placeholder: "\u5DE5\u65F6\uFF08\u5C0F\u65F6\uFF09", value: edit.hrs, onChange: ev => setEdit({ ...edit, hrs: ev.target.value, err: "" }), style: { ...inp, padding: 10 } }))),
+                            edit.err && React.createElement("div", { style: { marginTop: 6, fontSize: 12, color: K.red } }, edit.err),
+                            React.createElement("div", { style: { display: "flex", gap: 10, marginTop: 10 } },
+                                React.createElement("button", { onClick: saveEdit, style: { flex: 1, padding: "10px 0", borderRadius: 14, background: K.blue, color: dark ? K.bg : "#fff", fontWeight: 800, fontSize: 14 } }, "\u4FDD\u5B58"),
+                                React.createElement("button", { onClick: () => setEdit(null), style: { flex: 1, padding: "10px 0", borderRadius: 14, background: K.bg, color: K.sub, fontWeight: 700, fontSize: 14 } }, "\u53D6\u6D88"))) : React.createElement("div", { key: r.date, style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 0", borderTop: `1px dashed ${K.line}`, marginTop: 8 } },
+                            React.createElement("div", null,
+                                React.createElement("div", { style: { fontFamily: M, fontSize: 14, fontWeight: 700 } }, r.date.slice(5)),
+                                React.createElement("div", { style: { fontSize: 12, color: K.mute, marginTop: 2 } },
+                                    r.orders,
+                                    "\u5355",
+                                    r.isEstimate ? " · 估算" : "",
+                                    r.hours ? ` · ${r.hours}h · ¥${(r.pay / r.hours).toFixed(1)}/h` : "")),
+                            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12 } },
+                                React.createElement("b", { style: { fontFamily: M } },
+                                    "\u00A5",
+                                    r.pay.toFixed(1)),
+                                React.createElement("button", { onClick: () => startEdit(r), style: { background: "none", fontSize: 12, color: K.blue, fontWeight: 700 } }, "\u7F16\u8F91"),
+                                React.createElement("button", { onClick: () => del(r.date), style: { background: "none", fontSize: 12, color: K.mute } }, "\u5220\u9664")))))),
+                tab === "tr" && React.createElement("div", { style: card },
+                    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
+                        React.createElement("span", { style: lab }, "\u6536\u5165\u8D8B\u52BF"),
+                        React.createElement("div", { style: { display: "flex", background: K.bg, borderRadius: 99, padding: 3 } }, [["day", "日"], ["week", "周"], ["month", "月"]].map(([k, t]) => React.createElement("button", { key: k, onClick: () => setGran(k), style: { padding: "5px 14px", borderRadius: 99, fontSize: 13, fontWeight: 700, background: gran === k ? K.ink : "transparent", color: gran === k ? K.bg : K.sub } }, t)))),
+                    chart.length ? React.createElement(Chart, { data: chart }) : React.createElement("div", { style: { fontSize: 14, color: K.mute } }, "\u8BB0\u5F55\u51E0\u5929\u540E\u8FD9\u91CC\u4F1A\u51FA\u73B0\u8D8B\u52BF\u56FE\u3002")),
+                tab === "set" && React.createElement("div", { style: card },
+                    React.createElement("div", { style: { fontSize: 17, fontWeight: 800 } },
+                        monthLabel(vm),
+                        " \u8BBE\u7F6E"),
+                    [["本月起始单量（非从月初记录时填写）", sc[vm], v => save({ startCounts: { ...sc, [vm]: parseInt(v, 10) || 0 } })], ["起始单量对应的工时（选填）", sh[vm], v => save({ startHours: { ...sh, [vm]: parseFloat(v) || 0 } })], ["月度目标工资（元，选填）", goals[vm], v => { const g = { ...goals }, n = parseFloat(v); if (n)
+                                g[vm] = n;
+                            else
+                                delete g[vm]; save({ goals: g }); }]].map(([t, v, f]) => React.createElement("div", { key: t, style: { marginTop: 16 } },
+                        React.createElement("div", { style: { fontSize: 12, color: K.sub, marginBottom: 6 } }, t),
+                        React.createElement("input", { type: "number", inputMode: "decimal", value: v || "", placeholder: "0", onChange: e => f(e.target.value), style: inp }))),
+                    React.createElement("div", { style: { marginTop: 22, fontSize: 12, color: K.sub } }, "\u8BA1\u4EF7\u89C4\u5219"),
+                    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 8, fontSize: 13, color: K.sub } },
+                        "\u8DD1\u6EE1",
+                        React.createElement("input", { type: "number", value: tiers[0].limit, onChange: e => setT(0, "limit", e.target.value), style: { ...inp, width: 70, padding: 10 } }),
+                        "\u5355\uFF0C\u62FF",
+                        React.createElement("input", { type: "number", value: tiers[0].totalAtLimit, onChange: e => setT(0, "totalAtLimit", e.target.value), style: { ...inp, width: 82, padding: 10 } }),
+                        "\u5143",
+                        React.createElement("span", { style: { fontSize: 11, color: K.mute } }, "\u672A\u8DD1\u6EE1\u524D\u6309\u6BD4\u4F8B\u4F30\u7B97")),
+                    tiers.slice(1).map((t, k) => { const i = k + 1; return React.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: 8, marginTop: 10, fontSize: 13, color: K.sub } },
+                        React.createElement("span", { style: { width: 40 } },
+                            "\u7B2C",
+                            i,
+                            "\u6863"),
+                        t.limit === null ? React.createElement("span", { style: { ...inp, flex: 1, color: K.sub } }, "\u4EE5\u540E") : React.createElement("input", { type: "number", value: t.limit, onChange: e => setT(i, "limit", e.target.value), style: { ...inp, flex: 1, padding: 10 } }),
+                        "\u5355",
+                        React.createElement("input", { type: "number", step: "0.1", value: t.rate, onChange: e => setT(i, "rate", e.target.value), style: { ...inp, width: 64, padding: 10 } }),
+                        "\u5143"); }),
+                    React.createElement("button", { onClick: addT, style: { marginTop: 12, background: "none", color: K.blue, fontWeight: 700, fontSize: 14 } }, "+ \u6DFB\u52A0\u6863\u4F4D")))),
+        React.createElement("div", { style: { position: "fixed", left: 0, right: 0, bottom: 0, paddingBottom: "calc(env(safe-area-inset-bottom) + 10px)", paddingTop: 10, background: "linear-gradient(transparent," + K.bg + " 40%)" } },
+            React.createElement("div", { style: { width: "calc(100% - 32px)", maxWidth: 400, margin: "0 auto", display: "flex", background: K.tabbg, backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)", borderRadius: 99, padding: 5, boxShadow: "0 10px 30px -8px rgba(16,19,17,.25)" } }, [["ov", "总览"], ["rec", "记录"], ["tr", "趋势"], ["set", "设置"]].map(([k, t]) => React.createElement("button", { key: k, onClick: () => { setTab(k); setFlash(""); setMsg(""); setUndo(null); setEdit(null); }, style: { flex: 1, padding: "12px 0", borderRadius: 99, fontSize: 14, fontWeight: 700, background: tab === k ? K.ink : "transparent", color: tab === k ? K.bg : K.sub } }, t)))));
+}
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App, null));
+
+</script></body></html>
